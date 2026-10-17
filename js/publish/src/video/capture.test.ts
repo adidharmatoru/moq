@@ -17,6 +17,7 @@ class Frame {
 	codedHeight: number;
 	rotation?: number;
 	timestamp: number;
+	restamps: number;
 	closed = false;
 
 	constructor(source?: Frame, init?: { timestamp?: number; rotation?: number }) {
@@ -26,6 +27,7 @@ class Frame {
 		this.rotation =
 			init?.rotation === undefined ? source?.rotation : ((source?.rotation ?? 0) + init.rotation) % 360;
 		this.timestamp = init?.timestamp ?? source?.timestamp ?? 0;
+		this.restamps = source ? source.restamps + (init ? 1 : 0) : 0;
 		Frame.all.push(this);
 	}
 
@@ -335,6 +337,55 @@ test("a replay never starts below an earlier replay", async () => {
 		second.close();
 		capture.close();
 		restore();
+	}
+
+	expect(open()).toEqual([]);
+});
+
+test("a camera frame is stamped once, live or replayed to a late reader", async () => {
+	const processor = Object.getOwnPropertyDescriptor(globalThis, "MediaStreamTrackProcessor");
+	const videoFrame = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const readable = new ReadableStream<VideoFrame>({
+		start: (value) => {
+			controller = value;
+		},
+	});
+	Object.defineProperty(globalThis, "MediaStreamTrackProcessor", {
+		configurable: true,
+		value: class {
+			readonly readable = readable;
+		},
+	});
+	Object.defineProperty(globalThis, "VideoFrame", { configurable: true, value: Frame });
+	Frame.all = [];
+
+	const capture = new Capture({ source: {} as StreamTrack });
+	const early = new Effect();
+	const late = new Effect();
+
+	try {
+		await flush();
+		const reader = capture.out.frames.peek()?.subscribe(early).getReader();
+		if (!reader) throw new Error("no fanout");
+		controller.enqueue(new Frame(undefined, { timestamp: 5_000_000 }) as unknown as VideoFrame);
+		const live = (await reader.read()).value as unknown as Frame;
+		expect(live.restamps).toBe(1);
+		live.close();
+
+		const resumed = capture.out.frames.peek()?.subscribe(late).getReader();
+		if (!resumed) throw new Error("no fanout");
+		const first = (await resumed.read()).value as unknown as Frame;
+		expect(first.restamps).toBe(1);
+		first.close();
+	} finally {
+		late.close();
+		early.close();
+		capture.close();
+		if (processor) Object.defineProperty(globalThis, "MediaStreamTrackProcessor", processor);
+		else Reflect.deleteProperty(globalThis, "MediaStreamTrackProcessor");
+		if (videoFrame) Object.defineProperty(globalThis, "VideoFrame", videoFrame);
+		else Reflect.deleteProperty(globalThis, "VideoFrame");
 	}
 
 	expect(open()).toEqual([]);

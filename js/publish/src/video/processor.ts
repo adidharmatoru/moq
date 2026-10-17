@@ -5,17 +5,21 @@ import type { FromWorker, ToWorker } from "./capture-worker";
 import CaptureWorker from "./capture-worker.ts?worklet";
 import type { StreamTrack } from "./types";
 
+/** A captured frame, and its time on our wall clock in microseconds. */
+export type Timed = { frame: VideoFrame; timestamp: number };
+
 /**
  * Turns a camera track into a stream of frames, using the best pipeline the engine has.
  *
- * Timestamps are rewritten onto our wall clock so audio and video share one epoch, and so they stay
- * consistent when the source changes or the encoder reloads.
+ * Each frame comes with its time on our wall clock, so audio and video share one epoch and stay
+ * consistent when the source changes or the encoder reloads. A MediaStreamTrackProcessor's frames
+ * are left as delivered; the `<video>` fallback builds its own at that time.
  */
-export function TrackProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
+export function TrackProcessor(track: StreamTrack): ReadableStream<Timed> {
 	// Chrome exposes MediaStreamTrackProcessor on the window, so use it directly.
 	if ("MediaStreamTrackProcessor" in self) {
 		const input: ReadableStream<VideoFrame> = new MediaStreamTrackProcessor({ track }).readable;
-		return input.pipeThrough(rewrite());
+		return input.pipeThrough(timing());
 	}
 
 	// Safari and Firefox expose it only inside a dedicated worker, which means spawning one to find
@@ -54,7 +58,7 @@ class Epoch {
 	// `at` is when the frame arrived, in milliseconds on the installed clock. For the
 	// first frame it has to be measured as close to capture as possible: whatever delay sits between
 	// capture and the anchor becomes a permanent audio/video offset.
-	stamp(frame: VideoFrame, at: number): VideoFrame {
+	time(frame: VideoFrame, at: number): Timed {
 		const arrived = at * 1000;
 
 		if (this.#base === undefined) {
@@ -70,27 +74,24 @@ class Epoch {
 		// A stuck source leaves arrival time as the only clock we have, which is what the <video>
 		// fallback uses anyway.
 		const timestamp = this.#stuck ? arrived : frame.timestamp - this.#base + this.#zero;
-
-		const stamped = new VideoFrame(frame, { timestamp });
-		frame.close();
-		return stamped;
+		return { frame, timestamp };
 	}
 }
 
-// Stamps frames as they arrive, for pipelines that deliver straight to us.
-function rewrite(): TransformStream<VideoFrame, VideoFrame> {
+// Times frames as they arrive, for pipelines that deliver straight to us.
+function timing(): TransformStream<VideoFrame, Timed> {
 	const epoch = new Epoch();
 
-	return new TransformStream<VideoFrame>({
+	return new TransformStream<VideoFrame, Timed>({
 		transform(frame, controller) {
-			controller.enqueue(epoch.stamp(frame, Nano.toMilli(Nano(now()))));
+			controller.enqueue(epoch.time(frame, Nano.toMilli(Nano(now()))));
 		},
 	});
 }
 
 // Runs the native MediaStreamTrackProcessor in a worker, returning undefined if the engine doesn't
 // have one (or won't transfer the track), in which case the caller falls back.
-async function workerProcessor(source: StreamTrack): Promise<ReadableStream<VideoFrame> | undefined> {
+async function workerProcessor(source: StreamTrack): Promise<ReadableStream<Timed> | undefined> {
 	const worker = await spawn();
 	if (!worker) return undefined;
 
@@ -111,7 +112,7 @@ async function workerProcessor(source: StreamTrack): Promise<ReadableStream<Vide
 
 	const epoch = new Epoch();
 
-	return new ReadableStream<VideoFrame>({
+	return new ReadableStream<Timed>({
 		async pull(controller) {
 			worker.post({ type: "pull" });
 
@@ -123,7 +124,7 @@ async function workerProcessor(source: StreamTrack): Promise<ReadableStream<Vide
 					// realm has its own origin, so the shared Unix-anchored time origin translates it
 					// onto the host clock.
 					// biome-ignore lint/style/noRestrictedGlobals: a cross-realm origin, not a clock read.
-					controller.enqueue(epoch.stamp(msg.frame, msg.at - performance.timeOrigin));
+					controller.enqueue(epoch.time(msg.frame, msg.at - performance.timeOrigin));
 					return;
 				case "done":
 					worker.close();
@@ -220,13 +221,13 @@ function handle(worker: Worker): Handle {
 // native MediaStreamTrackProcessor at all.
 // Based on: https://jan-ivar.github.io/polyfills/mediastreamtrackprocessor.js
 // Thanks Jan-Ivar
-function videoProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
+function videoProcessor(track: StreamTrack): ReadableStream<Timed> {
 	console.warn("Using MediaStreamTrackProcessor polyfill; performance might suffer.");
 
 	let video: HTMLVideoElement;
 	let handle: number | undefined;
 
-	return new ReadableStream<VideoFrame>({
+	return new ReadableStream<Timed>({
 		async start() {
 			video = document.createElement("video") as HTMLVideoElement;
 			video.srcObject = new MediaStream([track]);
@@ -246,7 +247,8 @@ function videoProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
 					// captureTime is the frame's capture instant; both it and now are DOM timestamps,
 					// which the host clock shares, so audio and video stay on one epoch.
 					const timestamp = (metadata.captureTime ?? now) as Milli;
-					controller.enqueue(new VideoFrame(video, { timestamp: Micro.fromMilli(timestamp) }));
+					const frame = new VideoFrame(video, { timestamp: Micro.fromMilli(timestamp) });
+					controller.enqueue({ frame, timestamp: frame.timestamp });
 					resolve();
 				});
 			});
@@ -259,11 +261,11 @@ function videoProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
 }
 
 // Wraps a stream that can only be built asynchronously, without making the caller await it.
-function deferred(open: () => Promise<ReadableStream<VideoFrame>>): ReadableStream<VideoFrame> {
-	let reader: ReadableStreamDefaultReader<VideoFrame> | undefined;
+function deferred<T>(open: () => Promise<ReadableStream<T>>): ReadableStream<T> {
+	let reader: ReadableStreamDefaultReader<T> | undefined;
 	let cancelled = false;
 
-	return new ReadableStream<VideoFrame>({
+	return new ReadableStream<T>({
 		// Nothing is pulled until this settles, so the source is always ready by the first pull.
 		async start() {
 			const stream = await open();

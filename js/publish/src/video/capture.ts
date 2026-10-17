@@ -1,7 +1,7 @@
 import { Instant, Nano, now } from "@moq/clock";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import { Fanout } from "../fanout";
-import { TrackProcessor } from "./processor";
+import { type Timed, TrackProcessor } from "./processor";
 import { normalizeSource, type Source } from "./types";
 
 // Signals the capture reads.
@@ -62,10 +62,11 @@ export class Capture {
 		const source = effect.get(this.in.source);
 		if (!source) return;
 
-		// A capture track goes through MediaStreamTrackProcessor, which rewrites timestamps onto our
-		// wall clock so they stay consistent when the source changes or the encoder reloads. A
-		// FrameSource already stamps against that clock, so take its frames as they are.
-		const stream = "frames" in source ? source.frames : TrackProcessor(normalizeSource(source).track);
+		// A capture track goes through MediaStreamTrackProcessor, which times each frame on our wall
+		// clock so they stay consistent when the source changes or the encoder reloads. A FrameSource
+		// already stamps against that clock, so take its frames as they are.
+		const stream: ReadableStream<Timed> =
+			"frames" in source ? source.frames.pipeThrough(asTimed()) : TrackProcessor(normalizeSource(source).track);
 
 		const fanout = new Frames(stream.pipeThrough(this.#measure(source)));
 		effect.cleanup(() => fanout.close());
@@ -91,9 +92,9 @@ export class Capture {
 	}
 
 	// Sample live source metadata even when the coded dimensions stay unchanged.
-	#measure(source: Source): TransformStream<VideoFrame, VideoFrame> {
-		return new TransformStream<VideoFrame, VideoFrame>({
-			transform: (input, controller) => {
+	#measure(source: Source): TransformStream<Timed, Timed> {
+		return new TransformStream<Timed, Timed>({
+			transform: ({ frame: input, timestamp }, controller) => {
 				let frame = input;
 				try {
 					const scale = "frames" in source ? undefined : normalizeSource(source).scale;
@@ -115,7 +116,7 @@ export class Capture {
 					}
 					this.#native.set(native);
 
-					controller.enqueue(frame);
+					controller.enqueue({ frame, timestamp });
 				} catch (error) {
 					frame.close();
 					throw error;
@@ -129,7 +130,8 @@ export class Capture {
 	}
 }
 
-// A fanout that holds the newest frame and opens every new reader with a copy of it. A still source
+// A fanout that stamps each frame as it goes out, holds the newest one, and opens every new reader
+// with a copy of it. A still source
 // delivers a frame only when its picture changes, so without this a reader that attaches later (a
 // late viewer, an encoder resuming after a demand gap) waits for a change that may never come.
 // Video only: replaying audio would repeat sound.
@@ -145,14 +147,24 @@ class Frames extends Fanout<VideoFrame> {
 	// stamped here, and a later frame can be held below it.
 	#replayed = 0;
 
-	constructor(source: ReadableStream<VideoFrame>) {
-		const held: Held = { closed: false, at: Instant(0) };
-		const hold = new TransformStream<VideoFrame, VideoFrame>({
-			transform: (frame, controller) => {
+	constructor(source: ReadableStream<Timed>) {
+		const held: Held = { closed: false, timestamp: 0, at: Instant(0) };
+		const hold = new TransformStream<Timed, VideoFrame>({
+			transform: ({ frame, timestamp }, controller) => {
 				held.frame?.close();
 				held.frame = held.closed ? undefined : frame.clone();
 				held.at = now();
-				controller.enqueue(frame);
+
+				let stamped = frame;
+				if (frame.timestamp !== timestamp) {
+					try {
+						stamped = new VideoFrame(frame, { timestamp });
+					} finally {
+						frame.close();
+					}
+				}
+				held.timestamp = stamped.timestamp;
+				controller.enqueue(stamped);
 			},
 		});
 
@@ -178,7 +190,7 @@ class Frames extends Fanout<VideoFrame> {
 		// gap. Never stamp below the held stamp plus how long it was held, nor below an earlier replay.
 		const clock = now();
 		const elapsed = Nano.toMicro(Instant.durationSince(clock, this.#held.at));
-		const at = Math.round(Math.max(held.timestamp + elapsed, Nano.toMicro(Nano(clock)), this.#replayed));
+		const at = Math.round(Math.max(this.#held.timestamp + elapsed, Nano.toMicro(Nano(clock)), this.#replayed));
 		this.#replayed = at;
 		let first: VideoFrame | undefined = new VideoFrame(held, { timestamp: at });
 		this.#unread.add(first);
@@ -237,5 +249,11 @@ class Frames extends Fanout<VideoFrame> {
 	}
 }
 
-// The newest frame, when it came through, and whether the fanout closed.
-type Held = { frame?: VideoFrame; at: Instant; closed: boolean };
+// The newest frame before stamping, its stamp, when it came through, and whether the fanout closed.
+type Held = { frame?: VideoFrame; timestamp: number; at: Instant; closed: boolean };
+
+function asTimed(): TransformStream<VideoFrame, Timed> {
+	return new TransformStream<VideoFrame, Timed>({
+		transform: (frame, controller) => controller.enqueue({ frame, timestamp: frame.timestamp }),
+	});
+}
